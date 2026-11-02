@@ -1,0 +1,5 @@
+out/
+fixture/
+node_modules/
+*.log
+.DS_Store

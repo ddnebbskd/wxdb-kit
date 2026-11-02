@@ -1,0 +1,17 @@
+{
+  "name": "wxdb-kit",
+  "version": "1.0.0",
+  "description": "微信 4.x 本地数据库（WCDB/SQLCipher 变体）离线解析与导出工具链",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "fixture": "node tools/make-fixture.mjs",
+    "demo": "node tools/demo.mjs",
+    "test": "node tools/demo.mjs"
+  },
+  "dependencies": {}
+}
