@@ -1,5 +1,6 @@
 out/
 fixture/
+fixture-stress/
 node_modules/
 *.log
 .DS_Store

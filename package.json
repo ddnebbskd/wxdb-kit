@@ -11,7 +11,8 @@
   "scripts": {
     "fixture": "node tools/make-fixture.mjs",
     "demo": "node tools/demo.mjs",
-    "test": "node tools/demo.mjs"
+    "stress": "node tools/stress.mjs",
+    "test": "node tools/demo.mjs && node tools/stress.mjs --cases 8 --seed 1"
   },
   "dependencies": {}
 }

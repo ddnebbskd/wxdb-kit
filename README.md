@@ -44,9 +44,27 @@
 ```bash
 npm run fixture   # 生成合成的演示库（加密过）
 npm run demo      # 解密 → 解析 → 导出，并自检
+npm run stress    # 随机化压力测试（可选，默认 8 个用例）
 ```
 
+`npm run demo` 跑的是写死的那份演示库；`npm run stress` 跑的是每轮现场随机生成的库：
+
+```bash
+node tools/stress.mjs --cases 10 --seed 3
+```
+
+每个用例随机生成联系人数量、每个会话的消息条数（0 到 400）、消息类型分布、
+长文本、群前缀、空正文、未知发送者、未知类型，然后走完整链路，
+并用一套**独立重写**的规则算出「应该导出多少条」，跟实际结果对账。
+任何一条断言失败，退出码就是 1。
+
 跑完应该看到：
+
+```
+用例 01 [PASS]  表 4  原始 804  导出 728
+...
+共 10 个用例　通过 10　失败 0
+```
 
 ```
 密钥校验：通过
@@ -74,8 +92,10 @@ src/
   export.mjs      按天分段导出 txt / json
   cdp.mjs         极简 Chrome DevTools Protocol 客户端
 tools/
-  make-fixture.mjs  合成演示库（含加密侧，用于端到端自测）
-  demo.mjs          端到端演示 + 自检
+  make-fixture.mjs   合成演示库（含加密侧，用于端到端自测）
+  sqlite-fixture.mjs 两张工具共用的零件：保留区改造、消息表、批量插入
+  demo.mjs           端到端演示 + 自检
+  stress.mjs         随机化压力测试，每轮现场造数据并对账
 docs/
   01-page-format.md   页面格式
   02-message-types.md 消息类型编码

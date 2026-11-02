@@ -11,9 +11,9 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
-import { zstdCompressSync } from 'node:zlib'
 import { encryptFile } from '../src/sqlcipher.mjs'
 import { tableNameOf } from '../src/contact.mjs'
+import { PAGE_SIZE, patchReserve, makeMessageTable, insertMessages } from './sqlite-fixture.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -43,7 +43,7 @@ function quoteXml() {
   return `<msg><appmsg appid="" sdkver="0"><title>你刚才那句我记下了</title><type>57</type><refermsg><type>1</type><content>这周先把这个跑通</content></refermsg></appmsg></msg>`
 }
 function transferXml() {
-  return `<msg><appmsg appid="wxf0" sdkver="0"><title>转账</title><des>谢谢你请的那杯咖啡</des><type>2000</type><wcpayinfo><feedesc>￥18.00</feedesc></wcpayinfo></appmsg></msg>`
+  return `<msg><appmsg appid="" sdkver="0"><title>转账</title><des>谢谢你请的那杯咖啡</des><type>2000</type><wcpayinfo><feedesc>￥18.00</feedesc></wcpayinfo></appmsg></msg>`
 }
 function systemXml(text) {
   return `<sysmsg type="revokemsg"><content>${text}</content></sysmsg>`
@@ -54,6 +54,22 @@ const longText = (
   '演示用长文本：' +
   '这一段会被 zstd 压过再存进去，所以必须靠 WCDB_CT 标记或魔数判断才能解回来。'
 ).repeat(6)
+
+/** [ts, type, sender, text] → insertMessages 要的形状 */
+const rows = (list) =>
+  list.map(([ts, type, sender, text]) => ({ ts, type, senderId: senderIdOf(sender), text }))
+
+const IDS = new Map([
+  [SELF, 1],
+  [FRIEND, 2],
+  [ROOM, 3],
+])
+
+function senderIdOf(username) {
+  const id = IDS.get(username)
+  if (!id) throw new Error(`演示数据里出现了未登记的发送者：${username}`)
+  return id
+}
 
 const friendMsgs = [
   [t(1, 9, 12), 1, FRIEND, '早，今天那个库跑通了吗'],
@@ -93,42 +109,10 @@ const roomMsgs = [
   [t(2, 12, 1), 1, FRIEND, `${FRIEND}:\n中午吃啥`],
 ]
 
-/**
- * 建一个"带保留区"的 SQLite 库。
- *
- * 真实的 WCDB 库每页 4096 字节，最后 80 字节留空给 IV 和 HMAC，
- * 也就是 SQLite 的 reserved space（usable = 4096 - 80 = 4016）。
- * node:sqlite 没有暴露设置它的接口，但这两个值都写在文件里：
- *   文件头第 20 字节        = 每页保留字节数
- *   第 1 页 b-tree 头 +105  = 单元格内容起始偏移
- * 先建一个空库（schema 为空），把这两处一起改掉再重开，
- * SQLite 就会按 4016 的可用空间重新排版。
- */
-function patchReserve(path, reserve = 80) {
-  const db = new DatabaseSync(path)
-  db.exec('PRAGMA page_size = 4096;')
-  db.exec('create table __probe(x); drop table __probe;')
-  db.close()
-
-  const buf = readFileSync(path)
-  const usable = 4096 - reserve
-  buf[20] = reserve
-  buf.writeUInt16BE(usable, 105) // 第 1 页 b-tree：单元格内容区起点
-  writeFileSync(path, buf)
-
-  const check = new DatabaseSync(path, { readOnly: true })
-  const integrity = check.prepare('PRAGMA integrity_check').all()
-  const pageSize = check.prepare('PRAGMA page_size').get()
-  check.close()
-  const verdict = String(Object.values(integrity[0] || {})[0] || '')
-  if (verdict !== 'ok') throw new Error(`保留区改造后完整性校验失败：${verdict}`)
-  return pageSize
-}
-
 function createPlainDb(path) {
   rmSync(path, { force: true })
-  const { page_size: pageSize } = patchReserve(path)
-  if (Number(pageSize) !== 4096) throw new Error(`页大小不是 4096：${pageSize}`)
+  const pageSize = patchReserve(path)
+  if (pageSize !== PAGE_SIZE) throw new Error(`页大小不是 ${PAGE_SIZE}：${pageSize}`)
 
   const db = new DatabaseSync(path)
 
@@ -149,52 +133,15 @@ function createPlainDb(path) {
   const insContact = db.prepare('insert into contact (username, alias, remark, nick_name) values (?, ?, ?, ?)')
   for (const c of contacts) insContact.run(c.username, c.alias, c.remark, c.nick)
 
-  const ids = new Map([
-    [SELF, 1],
-    [FRIEND, 2],
-    [ROOM, 3],
-  ])
   const insId = db.prepare('insert into Name2Id (rowid, user_name) values (?, ?)')
-  for (const [u, id] of ids) insId.run(id, u)
-
-  const makeTable = (name) => {
-    db.exec(`
-      create table "${name}" (
-        local_id integer primary key,
-        server_id integer,
-        local_type integer,
-        sort_seq integer,
-        real_sender_id integer,
-        create_time integer,
-        status integer,
-        message_content blob,
-        compress_content blob,
-        WCDB_CT_message_content integer
-      );
-    `)
-  }
-
-  const insert = (table, rows) => {
-    const stmt = db.prepare(
-      `insert into "${table}"
-        (local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, compress_content, WCDB_CT_message_content)
-        values (?, ?, ?, ?, ?, ?, 0, ?, null, ?)`
-    )
-    let i = 0
-    for (const [ts, type, sender, text] of rows) {
-      i++
-      const compressed = i === rows.length && text.length > 100
-      const body = compressed ? zstdCompressSync(Buffer.from(text, 'utf8')) : Buffer.from(text, 'utf8')
-      stmt.run(i, 100000 + i, type, i, ids.get(sender), ts, body, compressed ? 4 : 0)
-    }
-  }
+  for (const [u, id] of IDS) insId.run(id, u)
 
   const friendTable = tableNameOf(FRIEND)
   const roomTable = tableNameOf(ROOM)
-  makeTable(friendTable)
-  makeTable(roomTable)
-  insert(friendTable, friendMsgs)
-  insert(roomTable, roomMsgs)
+  makeMessageTable(db, friendTable)
+  makeMessageTable(db, roomTable)
+  insertMessages(db, friendTable, rows(friendMsgs))
+  insertMessages(db, roomTable, rows(roomMsgs))
 
   db.close()
   return { friendTable, roomTable }
@@ -226,7 +173,7 @@ function main() {
         roomName: '项目组',
         keyHex: key.toString('hex'),
         saltHex: salt.toString('hex'),
-        pages: Math.ceil(plain.length / 4096),
+        pages: Math.ceil(plain.length / PAGE_SIZE),
         bytes: enc.length,
       },
       null,
@@ -236,7 +183,7 @@ function main() {
   )
 
   console.log(`已生成演示库：${encPath}`)
-  console.log(`  页数 ${Math.ceil(plain.length / 4096)}，大小 ${enc.length} 字节`)
+  console.log(`  页数 ${Math.ceil(plain.length / PAGE_SIZE)}，大小 ${enc.length} 字节`)
   console.log(`  好友表 ${friendTable}`)
 }
 
